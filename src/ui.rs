@@ -18,11 +18,10 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Borders, Cell, Chart, Clear, Dataset, GraphType, List, ListItem,
     Paragraph, Row, Table, TableState, Tabs, Wrap,
 };
-use serde_json::json;
 
 use crate::client::Client;
 use crate::config::Config;
-use crate::snapshot::{self, Kind, Severity, Shared, Snapshot};
+use crate::snapshot::{self, Job, Kind, Severity, Shared, Snapshot};
 
 const TABS: [&str; 5] = ["Overview", "Sensors", "Charts", "Power", "Logs"];
 
@@ -72,7 +71,8 @@ struct Edit {
 }
 
 pub struct App {
-    client: Arc<Client>,
+    jobs: tokio::sync::mpsc::UnboundedSender<Job>,
+    refresh: Arc<tokio::sync::Notify>,
     shared: Shared,
     host: String,
     tab: usize,
@@ -83,18 +83,22 @@ pub struct App {
     confirm: Option<Confirm>,
     edit: Option<Edit>,
     help: bool,
-    logs: Vec<(String, String, String)>,
-    logs_loaded: bool,
-    status: String,
+    logs_asked: bool,
     quit: bool,
 }
 
 impl App {
-    pub fn new(client: Arc<Client>, shared: Shared, host: String) -> Self {
+    pub fn new(
+        jobs: tokio::sync::mpsc::UnboundedSender<Job>,
+        refresh: Arc<tokio::sync::Notify>,
+        shared: Shared,
+        host: String,
+    ) -> Self {
         let mut list = TableState::default();
         list.select(Some(0));
         Self {
-            client,
+            jobs,
+            refresh,
             shared,
             host,
             tab: 0,
@@ -104,9 +108,7 @@ impl App {
             confirm: None,
             edit: None,
             help: false,
-            logs: Vec::new(),
-            logs_loaded: false,
-            status: "connecting...".into(),
+            logs_asked: false,
             quit: false,
         }
     }
@@ -130,14 +132,19 @@ impl App {
 pub async fn run(cfg: Config, interval: f64) -> Result<()> {
     let client = Arc::new(Client::new(&cfg)?);
     let shared: Shared = Arc::new(Mutex::new(Snapshot::default()));
-    let poller = snapshot::spawn(
-        client.clone(),
+    shared.lock().unwrap().status = "connecting...".into();
+    let refresh = Arc::new(tokio::sync::Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = snapshot::spawn_worker(
+        client,
         shared.clone(),
         Duration::from_secs_f64(interval.max(0.5)),
+        refresh.clone(),
+        rx,
     );
 
     let mut term = ratatui::init();
-    let mut app = App::new(client, shared, cfg.host.clone());
+    let mut app = App::new(tx, refresh, shared, cfg.host.clone());
     let mut events = crossterm::event::EventStream::new();
     // Redraw on a timer as well as on input, so the clock and the live values
     // move even when nobody is touching the keyboard.
@@ -162,7 +169,7 @@ pub async fn run(cfg: Config, interval: f64) -> Result<()> {
         }
     };
 
-    poller.abort();
+    worker.abort();
     ratatui::restore();
     res
 }
@@ -172,7 +179,7 @@ async fn on_key(app: &mut App, k: KeyEvent) {
         match k.code {
             KeyCode::Esc => {
                 app.edit = None;
-                app.status = "cancelled".into();
+                say(app, "cancelled");
             }
             KeyCode::Backspace => {
                 if let Some(e) = app.edit.as_mut() {
@@ -186,7 +193,7 @@ async fn on_key(app: &mut App, k: KeyEvent) {
                     }
                 }
             }
-            KeyCode::Enter => apply_edit(app).await,
+            KeyCode::Enter => apply_edit(app),
             _ => {}
         }
         return;
@@ -201,24 +208,13 @@ async fn on_key(app: &mut App, k: KeyEvent) {
                 app.confirm = None;
                 match action {
                     Action::Reset(kind) => {
-                        let body = json!({ "ResetType": kind });
-                        match app
-                            .client
-                            .post(
-                                "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset",
-                                &body,
-                            )
-                            .await
-                        {
-                            Ok(()) => app.status = format!("{kind} accepted"),
-                            Err(e) => app.status = format!("{kind} refused: {e:#}"),
-                        }
+                        let _ = app.jobs.send(Job::Reset(kind));
                     }
                 }
             }
             _ => {
                 app.confirm = None;
-                app.status = "cancelled".into();
+                say(app, "cancelled");
             }
         }
         return;
@@ -236,11 +232,9 @@ async fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Tab | KeyCode::Right => app.tab = (app.tab + 1) % TABS.len(),
         KeyCode::BackTab | KeyCode::Left => app.tab = (app.tab + TABS.len() - 1) % TABS.len(),
         KeyCode::Char(d @ '1'..='5') => app.tab = d as usize - '1' as usize,
-        KeyCode::Char('r') => {
-            app.status = "refreshing...".into();
-            snapshot::refresh(app.client.clone(), app.shared.clone()).await;
-            app.status = "refreshed".into();
-        }
+        // Notify, do not wait. `Notify` coalesces, so leaning on the key
+        // queues nothing.
+        KeyCode::Char('r') => app.refresh.notify_one(),
         KeyCode::Up => move_sel(app, -1),
         KeyCode::Down => move_sel(app, 1),
         KeyCode::Home => app.list.select(Some(0)),
@@ -302,8 +296,11 @@ async fn on_key(app: &mut App, k: KeyEvent) {
                 });
             }
         }
-        4 if (k.code == KeyCode::Char('l') || !app.logs_loaded) => {
-            load_logs(app).await;
+        // First visit loads it, `l` reloads it. Either way the worker does the
+        // fetching, so opening the tab never freezes the interface.
+        4 if k.code == KeyCode::Char('l') || !app.logs_asked => {
+            app.logs_asked = true;
+            let _ = app.jobs.send(Job::Logs);
         }
         _ => {}
     }
@@ -323,13 +320,13 @@ fn start_edit(app: &mut App) {
         Kind::Temperature => ("Temperatures", "UpperThresholdCritical", s.upper_critical),
         Kind::Voltage => {
             drop(snap);
-            app.status = "voltage thresholds are not editable here".into();
+            say(app, "voltage thresholds are not editable here");
             return;
         }
     };
     let Some(id) = s.member_id.clone() else {
         drop(snap);
-        app.status = "this BMC did not give that sensor a member id".into();
+        say(app, "this BMC did not give that sensor a member id");
         return;
     };
     let edit = Edit {
@@ -344,26 +341,25 @@ fn start_edit(app: &mut App) {
     app.edit = Some(edit);
 }
 
-async fn apply_edit(app: &mut App) {
+fn apply_edit(app: &mut App) {
     let Some(e) = app.edit.take() else { return };
     let Ok(v) = e.buffer.trim().parse::<f64>() else {
-        app.status = format!("{} is not a number", e.buffer);
+        say(app, format!("{} is not a number", e.buffer));
         return;
     };
-    let body = json!({ e.array: [ { "MemberId": e.member_id, e.field: v } ] });
-    match app
-        .client
-        .patch("/redfish/v1/Chassis/Self/Thermal", &body)
-        .await
-    {
-        Ok(()) => {
-            app.status = format!("{} {} set to {v:.0}", e.sensor, e.field);
-            snapshot::refresh(app.client.clone(), app.shared.clone()).await;
-        }
-        // A refusal here is the normal case on many boards, so say so plainly
-        // instead of dressing it up as a failure of the tool.
-        Err(err) => app.status = format!("the BMC refused: {err:#}"),
-    }
+    // Handed to the worker. The PATCH and the re-poll that follows it both talk
+    // to the BMC, and neither belongs in the key handler.
+    let _ = app.jobs.send(Job::Threshold {
+        sensor: e.sensor,
+        array: e.array,
+        member: e.member_id,
+        field: e.field,
+        value: v,
+    });
+}
+
+fn say(app: &App, msg: impl Into<String>) {
+    app.shared.lock().unwrap().status = msg.into();
 }
 
 fn set_filter(app: &mut App, f: Filter) {
@@ -382,56 +378,6 @@ fn move_sel(app: &mut App, delta: i32) {
     let cur = app.list.selected().unwrap_or(0) as i32;
     let next = (cur + delta).rem_euclid(n as i32);
     app.list.select(Some(next as usize));
-}
-
-/// Redfish log services vary by vendor, so try the usual places and take the
-/// first that answers rather than assuming one layout.
-async fn load_logs(app: &mut App) {
-    app.logs_loaded = true;
-    let roots = [
-        "/redfish/v1/Systems/Self/LogServices",
-        "/redfish/v1/Managers/Self/LogServices",
-        "/redfish/v1/Chassis/Self/LogServices",
-    ];
-    for root in roots {
-        let Ok(v) = app.client.get_value(root).await else {
-            continue;
-        };
-        let members = v
-            .get("Members")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for m in members {
-            let Some(id) = m.get("@odata.id").and_then(|s| s.as_str()) else {
-                continue;
-            };
-            let path = format!("{id}/Entries");
-            let Ok(e) = app.client.get_value(&path).await else {
-                continue;
-            };
-            let entries = e
-                .get("Members")
-                .and_then(|m| m.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if entries.is_empty() {
-                continue;
-            }
-            app.logs = entries
-                .iter()
-                .rev()
-                .take(200)
-                .map(|x| {
-                    let get = |k: &str| x.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
-                    (get("Created"), get("Severity"), get("Message"))
-                })
-                .collect();
-            app.status = format!("{} entries from {id}", app.logs.len());
-            return;
-        }
-    }
-    app.status = "this BMC exposes no readable log service over Redfish".into();
 }
 
 // ------------------------------------------------------------------ draw ---
@@ -486,7 +432,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         1 => draw_sensors(f, rows[1], app, &snap),
         2 => draw_charts(f, rows[1], app, &snap),
         3 => draw_power(f, rows[1], &snap),
-        _ => draw_logs(f, rows[1], app),
+        _ => draw_logs(f, rows[1], &snap),
     }
 
     let keys = match app.tab {
@@ -505,7 +451,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         format!(" {keys}")
     };
-    let right = format!("{} | polled {age} | q quit  ? help ", app.status);
+    let what = if snap.busy {
+        "polling...".to_string()
+    } else {
+        snap.status.clone()
+    };
+    let right = format!("{what} | polled {age} | q quit  ? help ");
     let bar = Line::from(vec![
         Span::styled(
             left,
@@ -844,11 +795,11 @@ fn draw_power(f: &mut Frame, area: Rect, snap: &Snapshot) {
     f.render_widget(Paragraph::new(body).block(frame("Power")), area);
 }
 
-fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = if app.logs.is_empty() {
+fn draw_logs(f: &mut Frame, area: Rect, snap: &Snapshot) {
+    let items: Vec<ListItem> = if snap.logs.is_empty() {
         vec![ListItem::new("  press l to load")]
     } else {
-        app.logs
+        snap.logs
             .iter()
             .map(|(when, sev, msg)| {
                 let c = match sev.as_str() {
@@ -868,7 +819,7 @@ fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
             .collect()
     };
     f.render_widget(
-        List::new(items).block(frame(format!("Log ({} entries)", app.logs.len()))),
+        List::new(items).block(frame(format!("Log ({} entries)", snap.logs.len()))),
         area,
     );
 }

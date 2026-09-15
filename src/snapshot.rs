@@ -131,6 +131,12 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub last_poll: Option<std::time::Instant>,
     pub polls: u64,
+    /// True while a poll is in flight. The interface renders this instead of
+    /// keeping a sticky message, which used to leave "refreshing" on screen
+    /// long after the refresh had finished.
+    pub busy: bool,
+    pub status: String,
+    pub logs: Vec<(String, String, String)>,
 }
 
 impl Snapshot {
@@ -181,12 +187,18 @@ fn merge(dst: &mut Vec<Sensor>, fresh: Vec<Sensor>) {
 }
 
 async fn poll_once(c: &Client, shared: &Shared) {
+    shared.lock().unwrap().busy = true;
     let mut fresh: Vec<Sensor> = Vec::new();
     let mut err: Option<String> = None;
 
-    let sys = c.get::<System>("/redfish/v1/Systems/Self").await;
-    let pw = c.get::<Power>("/redfish/v1/Chassis/Self/Power").await;
-    let th = c.get::<Thermal>("/redfish/v1/Chassis/Self/Thermal").await;
+    // All three at once. A round trip to a busy BMC can take over a second,
+    // and chaining them tripled the poll time for no reason: none of them
+    // depends on the others.
+    let (sys, pw, th) = tokio::join!(
+        c.get::<System>("/redfish/v1/Systems/Self"),
+        c.get::<Power>("/redfish/v1/Chassis/Self/Power"),
+        c.get::<Thermal>("/redfish/v1/Chassis/Self/Thermal"),
+    );
 
     if let Err(e) = &sys {
         err = Some(format!("{e:#}"));
@@ -280,19 +292,146 @@ async fn poll_once(c: &Client, shared: &Shared) {
     g.error = err;
     g.last_poll = Some(std::time::Instant::now());
     g.polls += 1;
+    g.busy = false;
 }
 
-/// Poll forever. Returns a handle so the caller can drop it on exit.
-pub fn spawn(c: Arc<Client>, shared: Shared, interval: Duration) -> tokio::task::JoinHandle<()> {
+/// Lo que la interfaz puede pedir que se haga. Nada de esto se ejecuta en el
+/// bucle de dibujo: alli una espera de un segundo se ve como una interfaz
+/// colgada, y pulsar la tecla dos veces encolaba dos esperas.
+pub enum Job {
+    Logs,
+    Reset(&'static str),
+    Threshold {
+        sensor: String,
+        array: &'static str,
+        member: String,
+        field: &'static str,
+        value: f64,
+    },
+}
+
+fn say(shared: &Shared, msg: impl Into<String>) {
+    shared.lock().unwrap().status = msg.into();
+}
+
+/// The only place that talks to the BMC.
+///
+/// On-demand refresh arrives through `Notify` rather than the channel, on
+/// purpose: `Notify` COALESCES. Hitting `r` ten times leaves one poll pending
+/// instead of queueing ten that the interface would then wait through one
+/// after another.
+pub fn spawn_worker(
+    c: Arc<Client>,
+    shared: Shared,
+    interval: Duration,
+    refresh: Arc<tokio::sync::Notify>,
+    mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        poll_once(&c, &shared).await;
         loop {
-            poll_once(&c, &shared).await;
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => poll_once(&c, &shared).await,
+                _ = refresh.notified() => poll_once(&c, &shared).await,
+                Some(job) = jobs.recv() => run_job(&c, &shared, job).await,
+            }
         }
     })
 }
 
-/// One poll on demand, for the refresh key.
-pub async fn refresh(c: Arc<Client>, shared: Shared) {
-    poll_once(&c, &shared).await;
+async fn run_job(c: &Client, shared: &Shared, job: Job) {
+    match job {
+        Job::Logs => load_logs(c, shared).await,
+        Job::Reset(kind) => {
+            say(shared, format!("{kind}..."));
+            let body = serde_json::json!({ "ResetType": kind });
+            match c
+                .post(
+                    "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset",
+                    &body,
+                )
+                .await
+            {
+                Ok(()) => {
+                    say(shared, format!("{kind} accepted"));
+                    poll_once(c, shared).await;
+                }
+                Err(e) => say(shared, format!("{kind} refused: {e:#}")),
+            }
+        }
+        Job::Threshold {
+            sensor,
+            array,
+            member,
+            field,
+            value,
+        } => {
+            say(shared, format!("setting {sensor} {field}..."));
+            let body = serde_json::json!({ array: [ { "MemberId": member, field: value } ] });
+            match c.patch("/redfish/v1/Chassis/Self/Thermal", &body).await {
+                Ok(()) => {
+                    say(shared, format!("{sensor} {field} set to {value:.0}"));
+                    poll_once(c, shared).await;
+                }
+                // A refusal is the normal case on many boards, so say it
+                // plainly rather than dressing it up as a tool failure.
+                Err(e) => say(shared, format!("the BMC refused: {e:#}")),
+            }
+        }
+    }
+}
+
+/// Log services vary by vendor, so try the usual places and take the first
+/// that answers rather than assuming one layout.
+async fn load_logs(c: &Client, shared: &Shared) {
+    say(shared, "loading the log...");
+    let roots = [
+        "/redfish/v1/Systems/Self/LogServices",
+        "/redfish/v1/Managers/Self/LogServices",
+        "/redfish/v1/Chassis/Self/LogServices",
+    ];
+    for root in roots {
+        let Ok(v) = c.get_value(root).await else {
+            continue;
+        };
+        let members = v
+            .get("Members")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for m in members {
+            let Some(id) = m.get("@odata.id").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let Ok(e) = c.get_value(&format!("{id}/Entries")).await else {
+                continue;
+            };
+            let entries = e
+                .get("Members")
+                .and_then(|m| m.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if entries.is_empty() {
+                continue;
+            }
+            let rows: Vec<(String, String, String)> = entries
+                .iter()
+                .rev()
+                .take(200)
+                .map(|x| {
+                    let get = |k: &str| x.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    (get("Created"), get("Severity"), get("Message"))
+                })
+                .collect();
+            let n = rows.len();
+            let mut g = shared.lock().unwrap();
+            g.logs = rows;
+            g.status = format!("{n} entries from {id}");
+            return;
+        }
+    }
+    say(
+        shared,
+        "this BMC exposes no readable log service over Redfish",
+    );
 }
