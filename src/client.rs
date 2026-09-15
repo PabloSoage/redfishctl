@@ -56,6 +56,32 @@ impl Client {
         serde_json::from_value(v).with_context(|| format!("{path} did not have the expected shape"))
     }
 
+    /// Redfish patches arrays by member id: the body carries the whole array
+    /// name with a single entry inside, not an index into it.
+    pub async fn patch(&self, path: &str, body: &Value) -> Result<()> {
+        let url = format!("{}{}", self.base, path);
+        let res = self
+            .http
+            .patch(&url)
+            .basic_auth(&self.user, Some(&self.password))
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("PATCH {url} failed"))?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "{} {}
+{}",
+                status.as_u16(),
+                path,
+                describe(&text)
+            );
+        }
+        Ok(())
+    }
+
     pub async fn post(&self, path: &str, body: &Value) -> Result<()> {
         let url = format!("{}{}", self.base, path);
         let res = self

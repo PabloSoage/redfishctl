@@ -78,6 +78,8 @@ pub struct Power {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Fan {
+    /// Needed to PATCH a threshold: Redfish addresses array members by this.
+    pub member_id: Option<String>,
     pub name: Option<String>,
     pub reading: Option<i64>,
     pub reading_units: Option<String>,
@@ -88,6 +90,7 @@ pub struct Fan {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Temperature {
+    pub member_id: Option<String>,
     pub name: Option<String>,
     pub reading_celsius: Option<f64>,
     pub upper_threshold_critical: Option<f64>,

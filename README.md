@@ -1,12 +1,30 @@
-# bmctl
+# redfishctl
 
 Control and monitor a server's BMC from the terminal, over Redfish.
 
-Power the machine on and off, read every sensor it exposes, and follow consumption live —
-without opening the BMC's web interface and without `ipmitool` installed.
+Power the machine on and off, watch every sensor it exposes, chart consumption over time, and
+read the event log — without opening the BMC's web interface and without `ipmitool` installed.
+
+Run it with no arguments and you get an interactive interface. Nothing to memorise: the tabs are
+one keystroke apart and the keys for the current tab are always on screen.
 
 ```
-$ bmctl status
+ 1 Overview  2 Sensors  3 Charts  4 Power  5 Logs
+
+ Machine                             Attention (1)
+   power        On                     FAULT  GPU_FAN01   0 RPM
+   machine      GIGABYTE T181-G20      warn   GPU_RFAN05  1050 RPM
+   cpus         2  Xeon Platinum 8171M
+   memory       96 GiB
+   consumption  904 W
+
+ a all  t temps  f fans  v volts  p problems  enter chart  e edit threshold
+```
+
+The subcommands below still exist, because scripts need them.
+
+```
+$ redfishctl status
 
   power        On
   health       OK
@@ -41,22 +59,22 @@ Or grab a binary from the releases page.
 ## Setup
 
 ```sh
-bmctl config set --host 192.168.1.135 --user admin
+redfishctl config set --host 192.168.1.135 --user admin
 ```
 
 It prompts for the password without echoing it, and writes everything to a config file
-(`bmctl config path` tells you where) with owner-only permissions on Unix.
+(`redfishctl config path` tells you where) with owner-only permissions on Unix.
 
 Then check it:
 
 ```sh
-bmctl config test
+redfishctl config test
 ```
 
 ### About the password
 
 A BMC password has to be stored somewhere if you want unattended monitoring — that is the same
-trade-off `ipmitool -f` makes. What `bmctl` avoids is the ways it commonly leaks: it is never
+trade-off `ipmitool -f` makes. What `redfishctl` avoids is the ways it commonly leaks: it is never
 taken from a command-line argument, so it does not land in your shell history or in a process
 listing, and the config file is `0600`.
 
@@ -66,25 +84,43 @@ BMCs ship with self-signed certificates, so verification is **off** by default. 
 you have installed a real certificate:
 
 ```sh
-bmctl config set --verify-tls true
+redfishctl config set --verify-tls true
 ```
 
 ## Commands
 
 | | |
 |---|---|
-| `bmctl status` | Power state, model, consumption, hottest sensor, fan health |
-| `bmctl sensors` | Every sensor with a reading |
-| `bmctl sensors --fans` | Fans only. Also `--temps`, `--volts` |
-| `bmctl sensors --all` | Include sensors the BMC reports as absent |
-| `bmctl power status` | `On` or `Off` |
-| `bmctl power on` | Turn the host on |
-| `bmctl power off` | Ask the OS to shut down cleanly |
-| `bmctl power force-off` | Cut power without asking the OS |
-| `bmctl power reset` | Power cycle without asking the OS |
-| `bmctl watch` | Consumption and hottest sensor, live |
-| `bmctl watch --csv > log.csv` | Same, as CSV with epoch timestamps |
-| `bmctl raw <path>` | GET any Redfish path and print the JSON |
+| `redfishctl` | The interactive interface |
+| `redfishctl status` | Power state, model, consumption, hottest sensor, fan health |
+| `redfishctl sensors` | Every sensor with a reading |
+| `redfishctl sensors --fans` | Fans only. Also `--temps`, `--volts` |
+| `redfishctl sensors --all` | Include sensors the BMC reports as absent |
+| `redfishctl power status` | `On` or `Off` |
+| `redfishctl power on` | Turn the host on |
+| `redfishctl power off` | Ask the OS to shut down cleanly |
+| `redfishctl power force-off` | Cut power without asking the OS |
+| `redfishctl power reset` | Power cycle without asking the OS |
+| `redfishctl watch` | Consumption and hottest sensor, live |
+| `redfishctl watch --csv > log.csv` | Same, as CSV with epoch timestamps |
+| `redfishctl raw <path>` | GET any Redfish path and print the JSON |
+
+
+## The interactive interface
+
+| tab | what it is for |
+|---|---|
+| **Overview** | Is it fine? Machine identity, consumption, and anything wrong in its own panel |
+| **Sensors** | Every sensor, filterable, with its limit and state |
+| **Charts** | Power over time, plus any sensor you pick |
+| **Power** | On, shutdown, force-off, reset — each asks first |
+| **Logs** | Event log entries, severity-coloured |
+
+Faults are pulled out into their own panel on the Overview rather than being a colour buried in
+a list of ninety, because the question that tab answers is "is it fine?".
+
+Press `e` on a fan or a temperature to edit its critical threshold. Plenty of firmwares expose
+those read-only; when yours does, it says so and nothing changes.
 
 ### Sensors
 
@@ -101,7 +137,7 @@ Two things get flagged that a plain health field would not:
 ### Watching consumption
 
 ```sh
-bmctl watch --interval 1 --csv > run.csv
+redfishctl watch --interval 1 --csv > run.csv
 ```
 
 Each row carries a Unix timestamp, so the log can be lined up against whatever you were running
@@ -112,7 +148,7 @@ cost 300 W for 40 seconds".
 
 Written against a Gigabyte board with an AMI MegaRAC BMC (Redfish 1.8). It uses only standard
 schema paths, so it should work on any Redfish 1.x implementation. If your BMC names its
-resources differently, `bmctl raw /redfish/v1/Chassis` and `bmctl raw /redfish/v1/Systems` show
+resources differently, `redfishctl raw /redfish/v1/Chassis` and `redfishctl raw /redfish/v1/Systems` show
 the real ids.
 
 Every field is optional on the way in, so a BMC that implements less of the standard shows less

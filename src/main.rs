@@ -1,4 +1,4 @@
-//! bmctl — control and monitor a server's BMC over Redfish.
+//! redfishctl — control and monitor a server's BMC over Redfish.
 //!
 //! Redfish is the standard replacement for IPMI's sensor and control surface,
 //! and unlike IPMI it is plain HTTPS and JSON. That is why this tool speaks it
@@ -8,25 +8,34 @@
 //! What it deliberately does NOT do is scrape the BMC's web interface. That
 //! interface is itself a Redfish client, and scraping it breaks on every
 //! firmware update.
+//!
+//! Running it with no arguments opens the interactive interface, which is the
+//! way it is meant to be used. The subcommands exist for scripts; nobody should
+//! have to remember a flag to look at a fan.
 
 mod client;
 mod commands;
 mod config;
 mod models;
+mod snapshot;
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "bmctl",
+    name = "redfishctl",
     version,
     about = "Control and monitor a server's BMC over Redfish",
     long_about = None
 )]
 struct Cli {
+    /// Seconds between polls in the interactive interface
+    #[arg(long, default_value_t = 2.0, global = true)]
+    interval: f64,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -124,7 +133,12 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        // No subcommand: this is the normal way in.
+        let cfg = config::load()?;
+        return ui::run(cfg, cli.interval).await;
+    };
+    match command {
         Command::Config { action } => match action {
             ConfigAction::Set {
                 host,

@@ -1,17 +1,17 @@
 [package]
-name = "bmctl"
+name = "redfishctl"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Control and monitor a server's BMC over Redfish, from the terminal"
-repository = "https://github.com/PabloSoage/bmctl"
+repository = "https://github.com/PabloSoage/redfishctl"
 license = "MIT"
 readme = "README.md"
 keywords = ["redfish", "bmc", "ipmi", "server", "monitoring"]
 categories = ["command-line-utilities"]
 
 [[bin]]
-name = "bmctl"
+name = "redfishctl"
 path = "src/main.rs"
 
 [dependencies]
@@ -24,7 +24,9 @@ anyhow = "1"
 directories = "5"
 toml = "0.8"
 rpassword = "7"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = "0.30"
+futures = "0.3"
 
 [profile.release]
 opt-level = 3

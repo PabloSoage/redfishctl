@@ -1,0 +1,75 @@
+name: Release
+
+# Fires on pushing a version tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows x64
+            binary: redfishctl.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: Linux x64
+            binary: redfishctl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS (Apple Silicon)
+            binary: redfishctl
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # One name per platform: all three binaries land in the same release, and
+      # a bare "redfishctl.exe" would not say which one it is.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+             "dist/redfishctl-${{ matrix.target }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: redfishctl-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Draft, so the notes can be edited before anyone sees them.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true
