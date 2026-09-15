@@ -84,6 +84,9 @@ pub struct App {
     edit: Option<Edit>,
     help: bool,
     logs_asked: bool,
+    log_list: TableState,
+    log_only_bad: bool,
+    log_detail: bool,
     quit: bool,
 }
 
@@ -109,6 +112,9 @@ impl App {
             edit: None,
             help: false,
             logs_asked: false,
+            log_list: TableState::default(),
+            log_only_bad: false,
+            log_detail: false,
             quit: false,
         }
     }
@@ -220,6 +226,11 @@ async fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
+    if app.log_detail {
+        app.log_detail = false;
+        return;
+    }
+
     if app.help {
         app.help = false;
         return;
@@ -237,7 +248,15 @@ async fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('r') => app.refresh.notify_one(),
         KeyCode::Up => move_sel(app, -1),
         KeyCode::Down => move_sel(app, 1),
-        KeyCode::Home => app.list.select(Some(0)),
+        KeyCode::PageUp => move_sel(app, -10),
+        KeyCode::PageDown => move_sel(app, 10),
+        KeyCode::Home => {
+            if app.tab == 4 {
+                app.log_list.select(Some(0));
+            } else {
+                app.list.select(Some(0));
+            }
+        }
         _ => {}
     }
 
@@ -298,10 +317,23 @@ async fn on_key(app: &mut App, k: KeyEvent) {
         }
         // First visit loads it, `l` reloads it. Either way the worker does the
         // fetching, so opening the tab never freezes the interface.
-        4 if k.code == KeyCode::Char('l') || !app.logs_asked => {
-            app.logs_asked = true;
-            let _ = app.jobs.send(Job::Logs);
-        }
+        4 => match k.code {
+            KeyCode::Char('l') => {
+                app.logs_asked = true;
+                let _ = app.jobs.send(Job::Logs);
+            }
+            KeyCode::Char('p') => {
+                app.log_only_bad = !app.log_only_bad;
+                app.log_list.select(Some(0));
+            }
+            KeyCode::Enter => app.log_detail = true,
+            _ => {
+                if !app.logs_asked {
+                    app.logs_asked = true;
+                    let _ = app.jobs.send(Job::Logs);
+                }
+            }
+        },
         _ => {}
     }
 }
@@ -368,16 +400,24 @@ fn set_filter(app: &mut App, f: Filter) {
 }
 
 fn move_sel(app: &mut App, delta: i32) {
-    let n = {
-        let snap = app.shared.lock().unwrap();
-        app.visible(&snap).len()
+    let snap = app.shared.lock().unwrap();
+    let (n, state) = if app.tab == 4 {
+        (visible_logs(app, &snap).len(), &mut app.log_list)
+    } else {
+        (app.visible(&snap).len(), &mut app.list)
     };
     if n == 0 {
         return;
     }
-    let cur = app.list.selected().unwrap_or(0) as i32;
-    let next = (cur + delta).rem_euclid(n as i32);
-    app.list.select(Some(next as usize));
+    let cur = state.selected().unwrap_or(0) as i32;
+    state.select(Some((cur + delta).rem_euclid(n as i32) as usize));
+}
+
+fn visible_logs<'a>(app: &App, snap: &'a Snapshot) -> Vec<&'a snapshot::LogEntry> {
+    snap.logs
+        .iter()
+        .filter(|e| !app.log_only_bad || e.interesting())
+        .collect()
 }
 
 // ------------------------------------------------------------------ draw ---
@@ -432,14 +472,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         1 => draw_sensors(f, rows[1], app, &snap),
         2 => draw_charts(f, rows[1], app, &snap),
         3 => draw_power(f, rows[1], &snap),
-        _ => draw_logs(f, rows[1], &snap),
+        _ => draw_logs(f, rows[1], app, &snap),
     }
 
     let keys = match app.tab {
         1 => "a all  t temps  f fans  v volts  p problems  enter chart  e edit threshold",
         2 => "enter a sensor on the Sensors tab to chart it",
         3 => "o on  s shutdown  F force-off  R reset",
-        4 => "l reload",
+        4 => "l reload  p only problems  enter detail  up/down move",
         _ => "",
     };
     let age = snap
@@ -480,7 +520,42 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    if let Some(e) = &app.edit {
+    if app.log_detail {
+        // The raw IPMI decode lives here and only here: it is what made the
+        // list unreadable, but it is also the only place the event data is.
+        let vis = visible_logs(app, &snap);
+        let body = match app.log_list.selected().and_then(|i| vis.get(i)) {
+            Some(e) => format!(
+                "{}   {}
+{}
+
+{}
+
+any key to close",
+                e.when,
+                e.severity,
+                e.sensor_type,
+                if e.raw.is_empty() {
+                    "(no message)"
+                } else {
+                    &e.raw
+                }
+            ),
+            None => "nothing selected
+
+any key to close"
+                .to_string(),
+        };
+        let title = format!(
+            "Event {}",
+            app.log_list
+                .selected()
+                .and_then(|i| vis.get(i))
+                .map(|e| e.id.clone())
+                .unwrap_or_default()
+        );
+        popup(f, area, &title, &body, Color::Cyan);
+    } else if let Some(e) = &app.edit {
         let now = e
             .current
             .map(|v| format!("{v:.0}"))
@@ -795,31 +870,66 @@ fn draw_power(f: &mut Frame, area: Rect, snap: &Snapshot) {
     f.render_widget(Paragraph::new(body).block(frame("Power")), area);
 }
 
-fn draw_logs(f: &mut Frame, area: Rect, snap: &Snapshot) {
-    let items: Vec<ListItem> = if snap.logs.is_empty() {
-        vec![ListItem::new("  press l to load")]
-    } else {
-        snap.logs
-            .iter()
-            .map(|(when, sev, msg)| {
-                let c = match sev.as_str() {
-                    "Critical" | "Fatal" => Color::Red,
-                    "Warning" => Color::Yellow,
-                    _ => Color::Gray,
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<22}", when),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(format!("{:<9}", sev), Style::default().fg(c)),
-                    Span::raw(msg.clone()),
-                ]))
-            })
-            .collect()
-    };
-    f.render_widget(
-        List::new(items).block(frame(format!("Log ({} entries)", snap.logs.len()))),
-        area,
+fn draw_logs(f: &mut Frame, area: Rect, app: &mut App, snap: &Snapshot) {
+    let rows_src = visible_logs(app, snap);
+    if rows_src.is_empty() {
+        let msg = if snap.logs.is_empty() {
+            "
+  press l to load"
+        } else {
+            "
+  nothing but OK entries. Press p to show all."
+        };
+        f.render_widget(Paragraph::new(msg).block(frame("Log")), area);
+        return;
+    }
+
+    let rows: Vec<Row> = rows_src
+        .iter()
+        .map(|e| {
+            let c = match e.severity.as_str() {
+                "Critical" | "Fatal" => Color::Red,
+                "Warning" => Color::Yellow,
+                _ => Color::DarkGray,
+            };
+            Row::new(vec![
+                Cell::from(e.id.clone()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(e.when.clone()),
+                Cell::from(Span::styled(e.severity.clone(), Style::default().fg(c))),
+                Cell::from(e.sensor_type.clone()),
+                Cell::from(e.code.clone()),
+            ])
+        })
+        .collect();
+
+    let title = format!(
+        "Log — {} of {} entries{}",
+        rows_src.len(),
+        snap.logs.len(),
+        if app.log_only_bad {
+            ", problems only"
+        } else {
+            ""
+        }
     );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(7),
+            Constraint::Length(18),
+            Constraint::Length(10),
+            Constraint::Min(24),
+            Constraint::Length(10),
+        ],
+    )
+    .header(
+        Row::new(vec!["id", "when", "severity", "sensor type", "event"])
+            .style(Style::default().fg(Color::DarkGray)),
+    )
+    .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 60)))
+    .block(frame(title));
+
+    let mut st = app.log_list;
+    f.render_stateful_widget(table, area, &mut st);
+    app.log_list = st;
 }

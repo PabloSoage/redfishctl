@@ -119,10 +119,16 @@ redfishctl config set --verify-tls true
 | **Sensors** | Every sensor, filterable, with its limit and state |
 | **Charts** | Power over time, plus any sensor you pick |
 | **Power** | On, shutdown, force-off, reset — each asks first |
-| **Logs** | Event log entries, severity-coloured |
+| **Logs** | Event log as a table: when, severity, sensor type, event. `enter` opens the raw entry |
 
 Faults are pulled out into their own panel on the Overview rather than being a colour buried in
 a list of ninety, because the question that tab answers is "is it fine?".
+
+On the Logs tab, `p` hides the routine `OK` entries. What Redfish calls the
+`Message` on a SEL record is a raw IPMI decode — `Event_Data_1 : 1,
+Record_Type : system event record, Sensor_Number : 0, ...` — so the table is
+built from the structured fields beside it and the raw text is kept for the
+detail view, where it belongs.
 
 Press `e` on a fan or a temperature to edit its critical threshold. Plenty of firmwares expose
 those read-only; when yours does, it says so and nothing changes.

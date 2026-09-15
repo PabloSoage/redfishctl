@@ -139,7 +139,30 @@ pub struct Snapshot {
     /// long after the refresh had finished.
     pub busy: bool,
     pub status: String,
-    pub logs: Vec<(String, String, String)>,
+    pub logs: Vec<LogEntry>,
+}
+
+/// One event, in the fields that mean something.
+///
+/// Redfish's `Message` on a SEL entry is a raw IPMI decode -- "Event_Data_1 :
+/// 1, Record_Type : system event record, Sensor_Number : 0, Event_Dir :
+/// Assertion event, ..." -- which is long, repetitive and almost never what you
+/// want to read. The structured fields next to it say the same thing better, so
+/// the table is built from those and the raw text is kept for the detail view.
+#[derive(Clone, Default)]
+pub struct LogEntry {
+    pub id: String,
+    pub when: String,
+    pub severity: String,
+    pub sensor_type: String,
+    pub code: String,
+    pub raw: String,
+}
+
+impl LogEntry {
+    pub fn interesting(&self) -> bool {
+        !matches!(self.severity.as_str(), "OK" | "")
+    }
 }
 
 impl Snapshot {
@@ -357,11 +380,21 @@ pub fn spawn_worker(
     mut jobs: tokio::sync::mpsc::UnboundedReceiver<Job>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        poll_once(&c, &shared).await;
+        // A minimum gap so that a BMC slower than the interval is not hammered
+        // back to back.
+        let floor = Duration::from_millis(500);
         loop {
+            let started = std::time::Instant::now();
+            poll_once(&c, &shared).await;
+
+            // Wait for what is LEFT of the interval, not the whole of it. The
+            // poll takes seconds against a BMC, and sleeping the full interval
+            // on top of that made the real period interval+duration: an
+            // interval of 3 s came out as a refresh every 8.
+            let wait = interval.saturating_sub(started.elapsed()).max(floor);
             tokio::select! {
-                _ = tokio::time::sleep(interval) => poll_once(&c, &shared).await,
-                _ = refresh.notified() => poll_once(&c, &shared).await,
+                _ = tokio::time::sleep(wait) => {}
+                _ = refresh.notified() => {}
                 Some(job) = jobs.recv() => run_job(&c, &shared, job).await,
             }
         }
@@ -443,19 +476,63 @@ async fn load_logs(c: &Client, shared: &Shared) {
             if entries.is_empty() {
                 continue;
             }
-            let rows: Vec<(String, String, String)> = entries
+            // The collection is paginated, and the first page is rarely all of
+            // it: this board holds 150 entries and serves 50 at a time. Follow
+            // the next link rather than showing a third of the log and calling
+            // it the log.
+            let mut all = entries;
+            let mut next = e
+                .get("Members@odata.nextLink")
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let mut pages = 0;
+            while let Some(link) = next.take() {
+                pages += 1;
+                if pages > 20 {
+                    break;
+                }
+                let Ok(more) = c.get_value(&link).await else {
+                    break;
+                };
+                if let Some(arr) = more.get("Members").and_then(|m| m.as_array()) {
+                    all.extend(arr.iter().cloned());
+                }
+                next = more
+                    .get("Members@odata.nextLink")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string);
+            }
+
+            let rows: Vec<LogEntry> = all
                 .iter()
                 .rev()
-                .take(200)
                 .map(|x| {
                     let get = |k: &str| x.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
-                    (get("Created"), get("Severity"), get("Message"))
+                    let when = {
+                        let t = get("EventTimestamp");
+                        let t = if t.is_empty() { get("Created") } else { t };
+                        // 2025-11-13T18:41:15Z -> 2025-11-13 18:41
+                        t.replace('T', " ")
+                            .trim_end_matches('Z')
+                            .chars()
+                            .take(16)
+                            .collect()
+                    };
+                    LogEntry {
+                        id: get("Id"),
+                        when,
+                        severity: get("Severity"),
+                        sensor_type: get("SensorType"),
+                        code: get("EntryCode"),
+                        raw: get("Message"),
+                    }
                 })
                 .collect();
             let n = rows.len();
+            let bad = rows.iter().filter(|r| r.interesting()).count();
             let mut g = shared.lock().unwrap();
             g.logs = rows;
-            g.status = format!("{n} entries from {id}");
+            g.status = format!("{n} entries, {bad} not OK");
             return;
         }
     }
