@@ -17,6 +17,9 @@ use crate::models::{Power, System, Thermal};
 /// second interval this is a bit over half an hour of history.
 pub const HISTORY: usize = 1024;
 
+/// One poll in this many also fetches the slow, slow-changing resources.
+const SLOW_EVERY: u64 = 4;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Temperature,
@@ -191,20 +194,42 @@ async fn poll_once(c: &Client, shared: &Shared) {
     let mut fresh: Vec<Sensor> = Vec::new();
     let mut err: Option<String> = None;
 
-    // All three at once. A round trip to a busy BMC can take over a second,
-    // and chaining them tripled the poll time for no reason: none of them
-    // depends on the others.
-    let (sys, pw, th) = tokio::join!(
-        c.get::<System>("/redfish/v1/Systems/Self"),
-        c.get::<Power>("/redfish/v1/Chassis/Self/Power"),
-        c.get::<Thermal>("/redfish/v1/Chassis/Self/Thermal"),
-    );
+    // SEQUENTIAL, deliberately, and measured against the alternative.
+    //
+    // Firing the three at once looked like the obvious win and made things
+    // worse. On an AMI MegaRAC serving 42 fans, timed on the wire:
+    //
+    //     one at a time, reusing the connection   5.2 s, every request 200
+    //     all three at once                       6.5 s, requests 3.7-6.5 s each
+    //
+    // The BMC serialises internally, so concurrency buys nothing and costs
+    // connection errors. What DOES pay is keeping the connection: the TLS
+    // handshake is 0.38 s and reuse drops it to 0.00002 s, so two of the three
+    // handshakes disappear.
+    //
+    // Power is the number that moves, and it is also the cheapest. Systems and
+    // Thermal change slowly and are the expensive ones, so they are polled one
+    // time in `SLOW_EVERY`. That takes the common poll from five seconds to
+    // about one and a half.
+    let slow = shared.lock().unwrap().polls % SLOW_EVERY == 0;
 
-    if let Err(e) = &sys {
-        err = Some(format!("{e:#}"));
+    let pw = c.get::<Power>("/redfish/v1/Chassis/Self/Power").await;
+    let (sys, th) = if slow {
+        (
+            Some(c.get::<System>("/redfish/v1/Systems/Self").await),
+            Some(c.get::<Thermal>("/redfish/v1/Chassis/Self/Thermal").await),
+        )
+    } else {
+        (None, None)
+    };
+
+    match (&sys, &pw) {
+        (Some(Err(e)), _) => err = Some(format!("{e:#}")),
+        (_, Err(e)) => err = Some(format!("{e:#}")),
+        _ => {}
     }
 
-    if let Ok(t) = &th {
+    if let Some(Ok(t)) = &th {
         for x in &t.temperatures {
             let st = x.status.as_ref();
             fresh.push(Sensor {
@@ -255,7 +280,7 @@ async fn poll_once(c: &Client, shared: &Shared) {
     }
 
     let mut g = shared.lock().unwrap();
-    if let Ok(s) = sys {
+    if let Some(Ok(s)) = sys {
         g.machine = Machine {
             power_state: s.power_state,
             health: s.status.as_ref().and_then(|x| x.health.clone()),
@@ -286,9 +311,13 @@ async fn poll_once(c: &Client, shared: &Shared) {
             }
         }
     }
-    let mut sensors = std::mem::take(&mut g.sensors);
-    merge(&mut sensors, fresh);
-    g.sensors = sensors;
+    // Sin pasada lenta no hay sensores frescos, y fundir una lista vacia
+    // borraria el historico.
+    if !fresh.is_empty() {
+        let mut sensors = std::mem::take(&mut g.sensors);
+        merge(&mut sensors, fresh);
+        g.sensors = sensors;
+    }
     g.error = err;
     g.last_poll = Some(std::time::Instant::now());
     g.polls += 1;

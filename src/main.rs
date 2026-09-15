@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 )]
 struct Cli {
     /// Seconds between polls in the interactive interface
-    #[arg(long, default_value_t = 2.0, global = true)]
+    #[arg(long, default_value_t = 3.0, global = true)]
     interval: f64,
     #[command(subcommand)]
     command: Option<Command>,

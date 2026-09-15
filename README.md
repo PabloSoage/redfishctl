@@ -51,10 +51,15 @@ boards, and Serial-over-LAN. For those, `ipmitool` remains the tool.
 ## Install
 
 ```sh
-cargo install --path .
+sh scripts/install.sh          # Linux, macOS
 ```
 
-Or grab a binary from the releases page.
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1    # Windows
+```
+
+Both build and put `redfishctl` in `~/.cargo/bin`, which rustup already has on
+your PATH. Or grab a binary from the releases page.
 
 ## Setup
 
@@ -143,6 +148,29 @@ redfishctl watch --interval 1 --csv > run.csv
 Each row carries a Unix timestamp, so the log can be lined up against whatever you were running
 on the machine. That is the point: it turns "the benchmark took 40 seconds" into "the benchmark
 cost 300 W for 40 seconds".
+
+
+## Polling
+
+The interface polls on a timer, and the timing is driven by how slow BMCs are
+rather than by taste. Measured on an AMI MegaRAC serving 42 fans:
+
+| | |
+|---|---|
+| `Chassis/Self/Power` | 1.6 s, 10 KB |
+| `Systems/Self` | 2.2 s, 5 KB |
+| `Chassis/Self/Thermal` | 2.5 s, 37 KB |
+| TLS handshake | 0.38 s, or 0.00002 s on a reused connection |
+
+Two consequences are baked in. The connection is kept alive, which removes the
+handshake from every request after the first. And the requests go **one at a
+time**: firing all three at once was tried and measured, and it was worse —
+6.5 s against 5.2 s, with individual requests stretching to 6.5 s and some
+failing outright, because the BMC serialises internally anyway.
+
+Power is polled every interval because it is the number that moves. The other
+two are polled one time in four, which takes the common poll to about a second
+and a half. Raise `--interval` if your BMC is slower still.
 
 ## Compatibility
 
