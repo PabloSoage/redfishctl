@@ -64,7 +64,7 @@ your PATH. Or grab a binary from the releases page.
 ## Setup
 
 ```sh
-redfishctl config set --host 192.168.1.135 --user admin
+redfishctl config set --host 192.168.1.100 --user admin
 ```
 
 It prompts for the password without echoing it, and writes everything to a config file
